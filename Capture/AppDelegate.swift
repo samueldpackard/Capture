@@ -49,8 +49,4 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     @objc func spaceDidChange(_ notification: Notification) {
         window.orderOut(nil)
     }
-
-    func windowDidResignKey(_ notification: Notification) {
-        window.orderOut(nil)
-    }
 }
