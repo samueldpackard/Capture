@@ -5,13 +5,13 @@ import UniformTypeIdentifiers
 class ContentViewModel: ObservableObject {
     @Published var isFocused: Bool = false
     @Published var inputText: String = ""
+    @Published var selectedImages: [URL] = [] // Moved selectedImages here
 }
 
 struct ContentView: View {
     @ObservedObject var viewModel: ContentViewModel
     @FocusState private var isFocused: Bool
     @State private var isDraggingOver = false
-    @State private var selectedImages: [URL] = []
 
     var body: some View {
         VStack {
@@ -26,35 +26,31 @@ struct ContentView: View {
                 .buttonStyle(PlainButtonStyle())
                 .padding(.leading)
 
-                // Custom Non-Droppable Text Field
-                NonDroppableTextField(text: $viewModel.inputText, placeholder: "Clear your head", onCommit: {
+                // Standard TextField
+                TextField("Clear your head", text: $viewModel.inputText, onCommit: {
                     let trimmedText = viewModel.inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmedText.isEmpty || !selectedImages.isEmpty {
+                    if !trimmedText.isEmpty || !viewModel.selectedImages.isEmpty {
                         sendDataToNotion(text: trimmedText)
                         resetState()
                     }
                     hideWindow()
                 })
                 .focused($isFocused)
+                .textFieldStyle(PlainTextFieldStyle())
+                .font(.system(size: 24))
+                .padding(.leading, 5)
                 .frame(height: 30)
             }
             .padding()
             .background(Color.clear)
 
-            // Display Selected Images
-            if !selectedImages.isEmpty {
-                ScrollView(.horizontal) {
-                    HStack {
-                        ForEach(selectedImages, id: \.self) { imageURL in
-                            ImageThumbnailView(imageURL: imageURL, removeAction: {
-                                if let index = selectedImages.firstIndex(of: imageURL) {
-                                    selectedImages.remove(at: index)
-                                }
-                            })
-                        }
+            // Display Selected Images using a separate view
+            if !viewModel.selectedImages.isEmpty {
+                ImageThumbnailsView(selectedImages: viewModel.selectedImages, removeAction: { imageURL in
+                    if let index = viewModel.selectedImages.firstIndex(of: imageURL) {
+                        viewModel.selectedImages.remove(at: index)
                     }
-                    .padding(.horizontal)
-                }
+                })
             }
         }
         .frame(width: 600)
@@ -64,7 +60,7 @@ struct ContentView: View {
                 .cornerRadius(12)
         )
         // Apply onDrop to the entire VStack
-        .onDrop(of: [UTType.image], isTargeted: $isDraggingOver, perform: handleDrop)
+        .onDrop(of: [UTType.fileURL], isTargeted: $isDraggingOver, perform: handleDrop)
         // Dotted line overlay
         .overlay(
             RoundedRectangle(cornerRadius: 12)
@@ -83,7 +79,7 @@ struct ContentView: View {
     // Method to reset the state
     func resetState() {
         viewModel.inputText = ""
-        selectedImages.removeAll()
+        viewModel.selectedImages.removeAll()
     }
 
     // Open File Picker
@@ -100,7 +96,7 @@ struct ContentView: View {
 
         panel.begin { response in
             if response == .OK {
-                self.selectedImages.append(contentsOf: panel.urls)
+                viewModel.selectedImages.append(contentsOf: panel.urls)
             }
             window.makeKeyAndOrderFront(nil) // Show the dialog box again
             NSApp.activate(ignoringOtherApps: true)
@@ -110,12 +106,13 @@ struct ContentView: View {
 
     // Handle Image Drop
     func handleDrop(providers: [NSItemProvider]) -> Bool {
+        var handled = false
         for provider in providers {
             if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
                 provider.loadItem(forTypeIdentifier: UTType.image.identifier, options: nil) { (item, error) in
                     if let url = item as? URL {
                         DispatchQueue.main.async {
-                            self.selectedImages.append(url)
+                            viewModel.selectedImages.append(url)
                         }
                     } else if let data = item as? Data,
                               let image = NSImage(data: data) {
@@ -127,17 +124,17 @@ struct ContentView: View {
                         do {
                             try imageData?.write(to: fileURL)
                             DispatchQueue.main.async {
-                                self.selectedImages.append(fileURL)
+                                viewModel.selectedImages.append(fileURL)
                             }
                         } catch {
                             print("Error saving dropped image: \(error)")
                         }
                     }
                 }
-                return true
+                handled = true
             }
         }
-        return false
+        return handled
     }
 
     func sendDataToNotion(text: String) {
@@ -148,10 +145,11 @@ struct ContentView: View {
         }
 
         // Retrieve Notion API token and Database ID from Keychain
-        guard let notionToken = getNotionAPIToken(),
-              let databaseID = getNotionDatabaseID() else {
-            DispatchQueue.main.async {
-                showAlert(message: "Notion API Token or Database ID not found in Keychain. Please add them to your Keychain.")
+        guard let notionToken = getPasswordFromKeychain(service: "NotionAPIToken", account: "Notion"),
+              let databaseID = getPasswordFromKeychain(service: "NotionDatabaseID", account: "Notion") else {
+            // Credentials are being requested asynchronously; wait and retry
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.sendDataToNotion(text: text)
             }
             return
         }
@@ -167,7 +165,7 @@ struct ContentView: View {
         var imageBlocks: [[String: Any]] = []
 
         // Upload images to Imgur and create image blocks
-        for imageURL in selectedImages {
+        for imageURL in viewModel.selectedImages {
             dispatchGroup.enter()
             uploadImageToImgur(fileURL: imageURL) { publicURL in
                 if let publicURL = publicURL {
@@ -224,9 +222,11 @@ struct ContentView: View {
     }
 
     func uploadImageToImgur(fileURL: URL, completion: @escaping (String?) -> Void) {
-        guard let clientID = getImgurClientID() else {
-            print("Imgur Client ID not found in Keychain.")
-            completion(nil)
+        guard let clientID = getPasswordFromKeychain(service: "ImgurClientID", account: "Imgur") else {
+            // Prompt for Imgur Client ID
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                self.uploadImageToImgur(fileURL: fileURL, completion: completion)
+            }
             return
         }
         guard let imageData = try? Data(contentsOf: fileURL) else {
@@ -244,14 +244,14 @@ struct ContentView: View {
         var body = Data()
 
         // Image data
-        body.append("--\(boundary)\r\n".data(using: .utf8)!)
-        body.append("Content-Disposition: form-data; name=\"image\"; filename=\"\(fileURL.lastPathComponent)\"\r\n".data(using: .utf8)!)
-        body.append("Content-Type: image/\(fileURL.pathExtension)\r\n\r\n".data(using: .utf8)!)
+        body.append("--\(boundary)\r\n")
+        body.append("Content-Disposition: form-data; name=\"image\"; filename=\"\(fileURL.lastPathComponent)\"\r\n")
+        body.append("Content-Type: image/\(fileURL.pathExtension)\r\n\r\n")
         body.append(imageData)
-        body.append("\r\n".data(using: .utf8)!)
+        body.append("\r\n")
 
         // Close boundary
-        body.append("--\(boundary)--\r\n".data(using: .utf8)!)
+        body.append("--\(boundary)--\r\n")
 
         request.httpBody = body
 
@@ -284,17 +284,7 @@ struct ContentView: View {
         task.resume()
     }
 
-    func getNotionAPIToken() -> String? {
-        return getPasswordFromKeychain(service: "NotionAPIToken", account: "Notion")
-    }
-
-    func getNotionDatabaseID() -> String? {
-        return getPasswordFromKeychain(service: "NotionDatabaseID", account: "Notion")
-    }
-
-    func getImgurClientID() -> String? {
-        return getPasswordFromKeychain(service: "ImgurClientID", account: "Imgur")
-    }
+    // MARK: - Keychain Access Functions
 
     func getPasswordFromKeychain(service: String, account: String) -> String? {
         let query: [String: Any] = [
@@ -308,22 +298,60 @@ struct ContentView: View {
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
 
-        guard status == errSecSuccess,
-              let data = item as? Data,
-              let password = String(data: data, encoding: .utf8) else {
-            print("Error retrieving \(service) from Keychain")
+        if status == errSecSuccess,
+           let data = item as? Data,
+           let password = String(data: data, encoding: .utf8) {
+            return password
+        } else {
+            // Prompt for input and store in Keychain
+            promptForKeychainEntry(service: service, account: account)
             return nil
         }
+    }
 
-        return password
+    func promptForKeychainEntry(service: String, account: String) {
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = "Enter \(service)"
+            alert.informativeText = "Please enter your \(service) for \(account):"
+            alert.alertStyle = .informational
+
+            let inputField = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 300, height: 24))
+            alert.accessoryView = inputField
+            alert.addButton(withTitle: "OK")
+            alert.addButton(withTitle: "Cancel")
+
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                let input = inputField.stringValue
+                // Store in Keychain
+                self.storePasswordInKeychain(service: service, account: account, password: input)
+            }
+        }
+    }
+
+    func storePasswordInKeychain(service: String, account: String, password: String) {
+        let data = password.data(using: .utf8)!
+        let query: [String: Any] = [
+            kSecClass as String:            kSecClassGenericPassword,
+            kSecAttrService as String:      service,
+            kSecAttrAccount as String:      account,
+            kSecValueData as String:        data
+        ]
+        let status = SecItemAdd(query as CFDictionary, nil)
+        if status != errSecSuccess {
+            print("Error storing \(service) in Keychain: \(status)")
+        }
     }
 
     func showAlert(message: String) {
-        let alert = NSAlert()
-        alert.messageText = message
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
+        DispatchQueue.main.async {
+            let alert = NSAlert()
+            alert.messageText = message
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+        }
     }
 
     func hideWindow() {
@@ -350,17 +378,47 @@ struct VisualEffectView: NSViewRepresentable {
 }
 
 // View for displaying image thumbnails with a delete button
+struct ImageThumbnailsView: View {
+    let selectedImages: [URL]
+    let removeAction: (URL) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal) {
+            LazyHStack {
+                ForEach(selectedImages, id: \.self) { imageURL in
+                    ImageThumbnailView(imageURL: imageURL, removeAction: {
+                        removeAction(imageURL)
+                    })
+                }
+            }
+            .padding(.horizontal)
+        }
+        .frame(height: 60)
+    }
+}
+
+// Optimized Image Thumbnail View
 struct ImageThumbnailView: View {
     let imageURL: URL
     let removeAction: () -> Void
     @State private var isHovering = false
+    @State private var thumbnailImage: NSImage?
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            Image(nsImage: NSImage(contentsOf: imageURL) ?? NSImage())
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(height: 50)
+            if let image = thumbnailImage {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(height: 50)
+            } else {
+                Rectangle()
+                    .fill(Color.gray.opacity(0.3))
+                    .frame(width: 50, height: 50)
+                    .onAppear {
+                        loadThumbnail()
+                    }
+            }
 
             if isHovering {
                 Button(action: {
@@ -377,6 +435,46 @@ struct ImageThumbnailView: View {
         }
         .onHover { hovering in
             isHovering = hovering
+        }
+    }
+
+    func loadThumbnail() {
+        DispatchQueue.global(qos: .background).async {
+            if let image = NSImage(contentsOf: imageURL) {
+                let resizedImage = resizeImage(image: image, maxSize: NSSize(width: 50, height: 50))
+                DispatchQueue.main.async {
+                    self.thumbnailImage = resizedImage
+                }
+            }
+        }
+    }
+
+    func resizeImage(image: NSImage, maxSize: NSSize) -> NSImage {
+        let aspectRatio = image.size.width / image.size.height
+        var newSize = maxSize
+
+        if aspectRatio > 1 {
+            newSize.height = maxSize.width / aspectRatio
+        } else {
+            newSize.width = maxSize.height * aspectRatio
+        }
+
+        let newImage = NSImage(size: newSize)
+        newImage.lockFocus()
+        image.draw(in: NSRect(origin: .zero, size: newSize),
+                   from: NSRect(origin: .zero, size: image.size),
+                   operation: .copy,
+                   fraction: 1.0)
+        newImage.unlockFocus()
+        return newImage
+    }
+}
+
+// Extension to append Data
+extension Data {
+    mutating func append(_ string: String) {
+        if let data = string.data(using: .utf8) {
+            append(data)
         }
     }
 }
